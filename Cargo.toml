@@ -1,0 +1,10 @@
+[package]
+edition = "2021"
+license = "MIT"
+name = "gluey"
+version = "0.1.0"
+
+[dependencies]
+anyhow = "1.0.58"
+fs2 = "0.4.3"
+gtk = {package = "gtk4", version = "0.4.8"}
