@@ -1,4 +1,4 @@
-use fs2::FileExt;
+use fs2::{lock_contended_error, FileExt};
 use gtk::{
     glib::{self, GString},
     prelude::*,
@@ -7,8 +7,9 @@ use gtk::{
 use std::{
     env,
     ffi::OsStr,
-    fs,
-    io::{self, Read, Write},
+    fmt,
+    fs::File,
+    io::{self, Read, Seek, SeekFrom, Write},
     path::PathBuf,
     str,
 };
@@ -17,14 +18,27 @@ const APP_ID: &str = "org.github.z_snails.gluey";
 const WELCOME_TEXT: &str = "Welcome to Gluey";
 
 #[derive(Debug)]
-pub struct Config {
+struct Config {
     text: GString,
+    config_file: File,
 }
 
+#[derive(Debug)]
+struct AlreadyOpen;
+
+impl fmt::Display for AlreadyOpen {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "An instance of gluey is already running")
+    }
+}
+
+impl std::error::Error for AlreadyOpen {}
+
 impl Config {
-    fn new() -> Self {
+    fn new(config_file: File) -> Self {
         Self {
             text: WELCOME_TEXT.into(),
+            config_file,
         }
     }
 
@@ -32,32 +46,41 @@ impl Config {
         write!(w, "{}", self.text)
     }
 
-    fn deserialize(data: &[u8]) -> anyhow::Result<Self> {
+    fn deserialize(data: &[u8], file: File) -> anyhow::Result<Self> {
         let text = GString::from(str::from_utf8(data)?.to_owned());
-        Ok(Config { text })
+        Ok(Config {
+            text,
+            config_file: file,
+        })
     }
 
     fn load() -> anyhow::Result<Self> {
         let config_loc = get_config_loc();
         eprintln!("config file location: {config_loc:?}");
-        Ok(if let Ok(mut config_file) = fs::File::open(config_loc) {
-            config_file.lock_shared()?;
+        if let Ok(mut config_file) = File::options().read(true).write(true).open(&config_loc) {
+            match config_file.try_lock_exclusive() {
+                Ok(()) => {}
+                Err(err) if err.kind() == lock_contended_error().kind() => Err(AlreadyOpen)?,
+                Err(err) => Err(err)?,
+            };
             let mut config = Vec::new();
             config_file.read_to_end(&mut config)?;
-            Config::deserialize(&config)?
+            Ok(Config::deserialize(&config, config_file)?)
         } else {
-            Config::new()
-        })
+            let config_file = File::options()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&config_loc)?;
+            config_file.try_lock_exclusive()?;
+            Ok(Config::new(config_file))
+        }
     }
 
-    fn save(&self) -> io::Result<()> {
-        let config_loc = get_config_loc();
-        config_loc
-            .parent()
-            .map(|config_dir| fs::DirBuilder::new().recursive(true).create(config_dir));
-        let mut config_file = fs::File::create(&config_loc)?;
-        config_file.lock_exclusive()?;
-        self.serialize(&mut config_file)
+    fn save(mut self) -> io::Result<()> {
+        self.config_file.seek(SeekFrom::Start(0))?;
+        self.config_file.set_len(0)?;
+        self.serialize(&self.config_file)
     }
 }
 
@@ -72,7 +95,7 @@ fn get_config_loc() -> PathBuf {
     config_loc
 }
 
-fn build_ui(app: &Application, text_buffer: &TextBuffer) {
+fn build_success(app: &Application, text_buffer: &TextBuffer) {
     let text = TextView::builder()
         .buffer(text_buffer)
         .wrap_mode(WrapMode::WordChar)
@@ -91,10 +114,11 @@ fn main() -> anyhow::Result<()> {
     let mut config = Config::load()?;
     eprintln!("config on open: {config:?}");
 
-    let app = Application::builder().application_id(APP_ID).build();
     let text_buffer = TextBuffer::builder().text(&config.text).build();
+
+    let app = Application::builder().application_id(APP_ID).build();
     app.connect_activate(
-        glib::clone!(@strong text_buffer => move |app| build_ui(app, &text_buffer)),
+        glib::clone!(@strong text_buffer => move |app| build_success(app, &text_buffer)),
     );
     app.run();
 
